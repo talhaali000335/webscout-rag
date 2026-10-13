@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 230 25% 7%;
+  --foreground: 220 20% 94%;
+  --card: 230 22% 11%;
+  --border: 230 15% 20%;
+  --muted: 230 18% 15%;
+  --muted-foreground: 225 12% 62%;
+  --primary: 252 90% 68%;
+  --primary-foreground: 0 0% 100%;
+}
+
+body {
+  @apply bg-background text-foreground antialiased;
+  background-image:
+    radial-gradient(900px 500px at 85% -10%, hsl(252 90% 60% / .18), transparent 60%),
+    radial-gradient(700px 400px at -5% 110%, hsl(190 90% 50% / .10), transparent 60%);
+  background-attachment: fixed;
+}
+
+* { @apply border-border; }
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-thumb { background: hsl(var(--border)); border-radius: 8px; }

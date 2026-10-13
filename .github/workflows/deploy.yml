@@ -1,0 +1,78 @@
+name: CI-CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# needed so GitHub can prove its identity to AWS (OIDC) - no AWS passwords stored in GitHub
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # 1) run the tests + make sure the frontend builds
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install pytest beautifulsoup4 lxml httpx pydantic-settings "numpy<2"
+      - run: pytest -q backend/tests
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: cd frontend && npm install --no-audit --no-fund && npm run build
+
+  # 2) build Docker images and push them to AWS ECR (only on main)
+  build-and-push:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push
+        run: |
+          REG=${{ steps.ecr.outputs.registry }}
+          for svc in backend frontend; do
+            docker build -t $REG/webscout-$svc:latest -t $REG/webscout-$svc:${{ github.sha }} ./$svc
+            docker push --all-tags $REG/webscout-$svc
+          done
+
+  # 3) tell the server (through AWS Systems Manager) to run deploy.sh: pull new images + restart
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Run deploy.sh on the server
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ vars.AWS_INSTANCE_ID }}" \
+            --document-name AWS-RunShellScript \
+            --parameters 'commands=["export HOME=/root","cd /opt/webscout","bash deploy/deploy.sh"]' \
+            --query Command.CommandId --output text)
+          echo "command id: $CMD_ID"
+          for i in $(seq 1 60); do            # wait up to 10 minutes
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" \
+              --instance-id "${{ vars.AWS_INSTANCE_ID }}" --query Status --output text 2>/dev/null || echo Pending)
+            echo "status: $STATUS"
+            case "$STATUS" in
+              Success) break ;;
+              Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 10
+          done
+          aws ssm get-command-invocation --command-id "$CMD_ID" \
+            --instance-id "${{ vars.AWS_INSTANCE_ID }}" \
+            --query '{out:StandardOutputContent,err:StandardErrorContent}' --output text
+          [ "$STATUS" = "Success" ]

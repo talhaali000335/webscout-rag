@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  WebScout-RAG on one small EC2 server (free-tier friendly). Creates: 2 ECR image repositories,
+  a firewall (security group), a server (EC2) with a fixed IP, an IAM role for the server, and a
+  password-less IAM role that GitHub Actions uses to push images and trigger deploys (OIDC).
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Description: "Your GitHub repo as OWNER/NAME, e.g. talha/webscout-rag"
+    AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+  GroqApiKey:
+    Type: String
+    NoEcho: true
+    Description: "Your Groq key (gsk_...). Hidden in the console."
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro, t3.small]
+    Description: "Pick the one the EC2 console labels 'Free tier eligible' (t2.micro or t3.micro). t3.small is NOT free but has 2 GB RAM."
+  EnableHttps:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "true = free HTTPS using <ip-with-dashes>.sslip.io + Let's Encrypt (recommended: you type passwords into the sign-in window)."
+  CreateGitHubOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Set to false ONLY if your AWS account already has an identity provider for token.actions.githubusercontent.com (stack fails with 'already exists' otherwise)."
+
+Conditions:
+  MakeOidcProvider: !Equals [!Ref CreateGitHubOidcProvider, "true"]
+
+Resources:
+  # ---------------------------------------------------------------- image storage
+  BackendRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: webscout-backend
+      EmptyOnDelete: true          # lets "delete stack" work even when images exist
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep last 4 images (saves storage cost)",
+           "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":4},
+           "action":{"type":"expire"}}]}
+
+  FrontendRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: webscout-frontend
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep last 4 images",
+           "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":4},
+           "action":{"type":"expire"}}]}
+
+  # ---------------------------------------------------------------- firewall
+  ServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: WebScout web traffic (no SSH - use Session Manager)
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80,  ToPort: 80,  CidrIp: 0.0.0.0/0, Description: HTTP }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS }
+      Tags: [{ Key: Name, Value: webscout-sg }]
+
+  # ---------------------------------------------------------------- server identity (what the server may do)
+  ServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly   # pull images
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore         # browser shell + receive deploy commands
+
+  ServerProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref ServerRole]
+
+  # ---------------------------------------------------------------- the server
+  ServerIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: webscout-ip }]
+
+  Server:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: "{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}"
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref ServerProfile
+      SecurityGroupIds: [!GetAtt ServerSecurityGroup.GroupId]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: { VolumeSize: 20, VolumeType: gp3, DeleteOnTermination: true }
+      Tags: [{ Key: Name, Value: webscout }]
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            # Runs ONCE when the server first boots. Log: /var/log/webscout-bootstrap.log
+            set -euxo pipefail
+            exec > >(tee /var/log/webscout-bootstrap.log) 2>&1
+
+            # 1) swap file - the server only has 1 GB RAM, swap is the safety net
+            fallocate -l 3G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+            # 2) tools: git, Docker, AWS CLI
+            apt-get update -y
+            apt-get install -y git curl unzip ca-certificates
+            curl -fsSL https://get.docker.com | sh
+            systemctl enable --now docker
+            curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscli.zip
+            unzip -q /tmp/awscli.zip -d /tmp && /tmp/aws/install
+
+            # 3) get your code from GitHub (repo must be public)
+            git clone https://github.com/${GitHubRepo}.git /opt/webscout
+            cd /opt/webscout
+
+            # 4) the server's private settings file (never committed to git)
+            cat > .env <<'ENVEOF'
+            GROQ_API_KEY=${GroqApiKey}
+            LLM_MODEL=llama-3.3-70b-versatile
+            ECR_REGISTRY=${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+            AWS_REGION=${AWS::Region}
+            ENVEOF
+            if [ "${EnableHttps}" = "true" ]; then
+              {
+                echo "COMPOSE_PROFILES=https"
+                echo "DOMAIN=$(echo '${PublicIp}' | tr . -).sslip.io"
+                echo "FRONTEND_PORT_MAP=127.0.0.1:8080:80"
+              } >> .env
+            fi
+            chmod 600 .env
+
+            # 5) first start. Images do not exist in ECR until GitHub Actions has run once, so this may fail - that's OK.
+            HOME=/root bash deploy/deploy.sh || echo "first deploy skipped (no images yet) - push to GitHub to deploy"
+          - PublicIp: !Ref ServerIp
+
+  ServerIpAttach:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ServerIp.AllocationId
+      InstanceId: !Ref Server
+
+  # ---------------------------------------------------------------- GitHub Actions access (no passwords/keys stored in GitHub)
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList: [6938fd4d98bab03faadb97b34396831e3780aea1]
+
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - MakeOidcProvider
+                - !Ref GitHubOidcProvider          # created above (!Ref gives its ARN, so it is built first)
+                - !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # ONLY pushes to the main branch of YOUR repo can use this role
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:ref:refs/heads/main
+      Policies:
+        - PolicyName: push-images-and-deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: [!GetAtt BackendRepo.Arn, !GetAtt FrontendRepo.Arn]
+              - Effect: Allow                     # "run deploy.sh on THAT server"
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Server}
+              - Effect: Allow
+                Action: [ssm:GetCommandInvocation, ssm:ListCommandInvocations]
+                Resource: "*"
+
+Outputs:
+  AppUrl:
+    Description: Open this after the first GitHub deploy finishes (HTTPS only works if EnableHttps=true)
+    Value: !Join ["", ["https://", !Join ["-", !Split [".", !Ref ServerIp]], ".sslip.io"]]
+  AppUrlPlainHttp:
+    Value: !Sub "http://${ServerIp}"
+  ServerIpAddress:
+    Value: !Ref ServerIp
+  InstanceId:
+    Description: "GitHub variable AWS_INSTANCE_ID"
+    Value: !Ref Server
+  GitHubRoleArn:
+    Description: "GitHub variable AWS_ROLE_ARN"
+    Value: !GetAtt GitHubActionsRole.Arn
+  Region:
+    Description: "GitHub variable AWS_REGION"
+    Value: !Ref AWS::Region
+  OpenServerShell:
+    Description: Browser terminal on the server (no SSH key needed)
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/${Server}?region=${AWS::Region}

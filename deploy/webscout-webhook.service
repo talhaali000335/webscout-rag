@@ -1,0 +1,12 @@
+[Unit]
+Description=WebScout deploy webhook
+After=network.target docker.service
+
+[Service]
+EnvironmentFile=/opt/webscout/deploy/webhook.env
+ExecStart=/usr/bin/python3 /opt/webscout/deploy/webhook_listener.py
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target

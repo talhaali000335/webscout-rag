@@ -1,0 +1,53 @@
+# Local:       docker compose up --build
+# On AWS EC2:  images are pulled from ECR (see deploy/deploy.sh)
+services:
+  frontend:
+    build: ./frontend
+    image: ${ECR_REGISTRY:-local}/webscout-frontend:latest
+    ports:
+      - "${FRONTEND_PORT_MAP:-80:80}"     # with HTTPS on, .env sets this to 127.0.0.1:8080:80
+    depends_on:
+      - backend
+    restart: unless-stopped
+    mem_limit: 64m
+
+  backend:
+    build: ./backend
+    image: ${ECR_REGISTRY:-local}/webscout-backend:latest
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATA_DIR: /data
+    volumes:
+      - app_data:/data               # saved vectors + saved site logins
+    shm_size: "256m"                 # Chromium needs a bit of shared memory
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "48mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    restart: unless-stopped
+    mem_limit: 80m
+
+  # Optional free HTTPS (Let's Encrypt). Enable by setting COMPOSE_PROFILES=https and DOMAIN in .env
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["https"]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - frontend
+    restart: unless-stopped
+    mem_limit: 64m
+
+volumes:
+  app_data:
+  caddy_data:
