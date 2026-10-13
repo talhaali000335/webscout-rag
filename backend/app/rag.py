@@ -113,6 +113,13 @@ class LLMError(Exception):
     pass
 
 
+def _payload(messages: list) -> dict:
+    body = {"model": settings.llm_model, "messages": messages, "temperature": 0, "max_tokens": 2000}
+    if settings.llm_model.startswith("openai/gpt-oss"):
+        body["reasoning_effort"] = "low"     # these models "think" first; keep it short and cheap
+    return body
+
+
 async def _groq_chat(messages: list) -> str:
     if not settings.groq_api_key:
         raise LLMError("GROQ_API_KEY is not set on the server")
@@ -121,8 +128,7 @@ async def _groq_chat(messages: list) -> str:
             r = await c.post(
                 f"{settings.groq_base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-                json={"model": settings.llm_model, "messages": messages,
-                      "temperature": 0, "max_tokens": 700})
+                json=_payload(messages))
     except httpx.HTTPError:
         raise LLMError("Could not reach Groq. Try again in a moment.")
     if r.status_code == 401:

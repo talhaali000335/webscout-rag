@@ -6,7 +6,7 @@ class Settings(BaseSettings):
 
     # LLM: Groq (free key at https://console.groq.com/keys). OpenAI-compatible API.
     groq_api_key: str = ""
-    llm_model: str = "llama-3.3-70b-versatile"   # faster/cheaper alternative: llama-3.1-8b-instant
+    llm_model: str = "openai/gpt-oss-120b"   # lighter/faster alternative: openai/gpt-oss-20b
     groq_base_url: str = "https://api.groq.com/openai/v1"
 
     # Infra
