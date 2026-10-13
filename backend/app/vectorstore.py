@@ -66,6 +66,12 @@ def search(cid: str, query_vec, k: int):
     return [(meta[i], float(sims[i])) for i in idx]
 
 
+def first_chunks(cid: str, n: int):
+    """The first n chunks in page order (used for "summarize this page" style questions)."""
+    _, meta = _load(cid)
+    return meta[:n]
+
+
 def cleanup() -> None:
     cutoff = time.time() - settings.vector_ttl_days * 86400
     for p in _dir().iterdir():

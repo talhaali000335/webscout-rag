@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import logging
+import re
 import time
 
 import httpx
@@ -72,7 +73,23 @@ async def index_chunks(cid, url, title, chunks) -> int:
 
 
 # --------------------------------------------------------------- retrieval
+# Broad questions ("summarize this page", "what is this about") do not match any single passage,
+# so the re-ranker scores every chunk low and would throw them all away. For those we hand the
+# LLM the first chunks of the page (page order) instead.
+_OVERVIEW = re.compile(
+    r"\b(summari[sz]e|summary|overview|tl;?dr|what(?:'s| is| are) (?:this|the) (?:page|site|website|article)"
+    r"|what (?:does|is) (?:this|the) (?:page|site|website|article)[^?]*(?:about|for)"
+    r"|(?:this|the) page (?:is )?about|what(?:'s| is) (?:on|in) (?:this|the) page|about this page)\b",
+    re.I)
+_GREETING = re.compile(r"^\s*(hi|hello|hey|hola|salam|assalam[^\s]*|good (morning|afternoon|evening))\W*$", re.I)
+GREETING_REPLY = ("Hi! Ask me anything about the page you scraped, e.g. "
+                  "\"Summarize this page\" or a specific question about its content.")
+
+
 def _retrieve_sync(cid: str, question: str):
+    if _OVERVIEW.search(question):
+        return [{"text": c["text"], "url": c["url"], "heading": c["heading"], "score": 0.0}
+                for c in vectorstore.first_chunks(cid, settings.final_k + 1)]
     q_emb = next(iter(_get_embedder().query_embed(question)))
     hits = vectorstore.search(cid, q_emb, settings.retrieve_k)
     if not hits:
@@ -133,6 +150,10 @@ async def answer(cid: str, question: str, history: list | None = None) -> dict:
         prev = [h["content"] for h in history if h.get("role") == "user"]
         if prev:
             search_q = f"{prev[-1]} {question}"
+
+    if _GREETING.match(question):
+        return {"answer": GREETING_REPLY, "sources": [], "grounded": True,
+                "latency_ms": int((time.time() - t0) * 1000)}
 
     passages = await retrieve(cid, search_q)
     if not passages:
